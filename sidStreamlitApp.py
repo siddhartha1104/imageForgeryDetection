@@ -1,218 +1,285 @@
 import streamlit as st
-import numpy as np
 from PIL import Image
+import numpy as np
+import os
+import sys
 import torch
 import torch.nn as nn
-import os
-import tempfile
+import imageio
 import time
 
-# Set page configuration
-st.set_page_config(
-    page_title="HiFi Image Forgery Detection",
-    page_icon="🔍",
-    layout="wide"
-)
+# Import your existing modules
+# Note: You'll need to make sure these modules are accessible when deploying
+from utils.utils import *
+from utils.custom_loss import IsolatingLossFunction, load_center_radius_api
+from models.seg_hrnet import get_seg_model
+from models.seg_hrnet_config import get_cfg_defaults
+from models.NLCDetection_api import NLCDetection
 
-# Create a placeholder for the model
-class MockHiFiNet:
-    """
-    This is a mock implementation of your HiFi_Net class
-    In a real deployment, you would include your actual model code here
-    """
+class HiFi_Net():
+    '''
+        FENET is the multi-branch feature extractor.
+        SegNet contains the classification and localization modules.
+        LOSS_MAP is the classification loss function class.
+    '''
     def __init__(self):
-        # Simulate model loading time
-        time.sleep(2)
-        self.loaded = True
+        # Use CPU if CUDA is not available
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        st.sidebar.info(f"Using device: {self.device}")
+
+        FENet_cfg = get_cfg_defaults()
+        FENet = get_seg_model(FENet_cfg).to(self.device)
+        SegNet = NLCDetection().to(self.device)
         
-    def detect(self, image_path, verbose=False):
-        """Mock detection - returns random result for demo purposes"""
-        time.sleep(1)  # Simulate processing time
-        is_forged = np.random.choice([True, False], p=[0.7, 0.3])
-        confidence = np.random.uniform(60, 95) if is_forged else np.random.uniform(60, 95)
-        
-        if not verbose:
-            return int(is_forged), confidence / 100.0
+        if torch.cuda.is_available():
+            device_ids = [0]
+            FENet = nn.DataParallel(FENet)
+            SegNet = nn.DataParallel(SegNet)
+
+        self.FENet = restore_weight_helper(FENet, "weights/HRNet", 750001)
+        self.SegNet = restore_weight_helper(SegNet, "weights/NLCDetection", 750001)
+        self.FENet.eval()
+        self.SegNet.eval()
+
+        center, radius = load_center_radius_api()
+        self.LOSS_MAP = IsolatingLossFunction(center, radius).to(self.device)
+
+    def _transform_image(self, image_data):
+        '''transform the image.'''
+        if isinstance(image_data, str):
+            image = imageio.imread(image_data)
         else:
-            decision = "Forged" if is_forged else "Real"
+            image = image_data  # Assume it's already a numpy array
+            
+        image = Image.fromarray(image)
+        image = image.resize((256, 256), resample=Image.BICUBIC)
+        image = np.asarray(image)
+        image = image.astype(np.float32) / 255.
+        image = torch.from_numpy(image)
+        image = image.permute(2, 0, 1)
+        image = torch.unsqueeze(image, 0)
+        return image.to(self.device)
+
+    def _normalized_threshold(self, res, prob, threshold=0.5):
+        '''to interpret detection result via omitting the detection decision.'''
+        if res > threshold:
+            decision = "Forged"
+            prob = (prob - threshold) / threshold
+        else:
+            decision = 'Real'
+            prob = (threshold - prob) / threshold
+        return decision, prob * 100  # Return confidence as percentage
+
+    def detect(self, image_data):
+        """
+            Para: image_data can be a path string or numpy array
+            Return:
+                decision: "Real" or "Forged"
+                confidence: confidence percentage
+        """
+        with torch.no_grad():
+            img_input = self._transform_image(image_data)
+            output = self.FENet(img_input)
+            mask1_fea, mask1_binary, out0, out1, out2, out3 = self.SegNet(output, img_input)
+            res, prob = one_hot_label_new(out3)
+            res = level_1_convert(res)[0]
+            decision, confidence = self._normalized_threshold(res, prob[0])
             return decision, confidence
+
+    def localize(self, image_data):
+        """
+            Para: image_data can be a path string or numpy array
+            Return:
+                binary_mask: forgery mask.
+        """
+        with torch.no_grad():
+            img_input = self._transform_image(image_data)
+            output = self.FENet(img_input)
+            mask1_fea, mask1_binary, out0, out1, out2, out3 = self.SegNet(output, img_input)
+            pred_mask, pred_mask_score = self.LOSS_MAP.inference(mask1_fea)  # inference
+            pred_mask_score = pred_mask_score.cpu().numpy()
+            ## 2.3 is the threshold used to separate the real and fake pixels.
+            pred_mask_score[pred_mask_score < 2.3] = 0.
+            pred_mask_score[pred_mask_score >= 2.3] = 1.
+            binary_mask = pred_mask_score[0]
+            return binary_mask
+
+
+# Configure the Streamlit page
+def set_page_config():
+    st.set_page_config(
+        page_title="HiFi Image Forgery Detection",
+        page_icon="🔍",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
     
-    def localize(self, image_path):
-        """Mock localization - returns a random mask for demo purposes"""
-        time.sleep(1)  # Simulate processing time
-        
-        # Read the image to get its dimensions
-        if isinstance(image_path, str):
-            img = Image.open(image_path)
-        else:
-            img = Image.fromarray(image_path)
-            
-        # Create a random binary mask (more complex in real implementation)
-        w, h = 256, 256  # Fixed size used in the original code
-        mask = np.zeros((h, w), dtype=np.uint8)
-        
-        # Add some random "forgery" regions
-        num_regions = np.random.randint(1, 4)
-        for _ in range(num_regions):
-            x = np.random.randint(0, w - 50)
-            y = np.random.randint(0, h - 50)
-            size_x = np.random.randint(30, 70)
-            size_y = np.random.randint(30, 70)
-            mask[y:y+size_y, x:x+size_x] = 1
-            
-        return mask
+    # Custom CSS to improve the look and feel
+    st.markdown("""
+        <style>
+        .main {
+            padding: 2rem;
+        }
+        .stImage > img {
+            max-width: 100%;
+            height: auto;
+            border-radius: 5px;
+        }
+        .result-text {
+            font-size: 1.5rem;
+            font-weight: bold;
+            padding: 1rem;
+            border-radius: 5px;
+            text-align: center;
+        }
+        .forged {
+            background-color: rgba(255, 0, 0, 0.1);
+            color: darkred;
+        }
+        .real {
+            background-color: rgba(0, 128, 0, 0.1);
+            color: darkgreen;
+        }
+        </style>
+    """, unsafe_allow_html=True)
 
 # Initialize session state variables
-if 'model' not in st.session_state:
-    st.session_state['model'] = None
-    st.session_state['model_loaded'] = False
-    st.session_state['result_mask'] = None
-    st.session_state['analyzed'] = False
+def init_session_state():
+    if 'model' not in st.session_state:
+        st.session_state.model = None
+    if 'model_loaded' not in st.session_state:
+        st.session_state.model_loaded = False
+    if 'uploaded_image' not in st.session_state:
+        st.session_state.uploaded_image = None
+    if 'result_mask' not in st.session_state:
+        st.session_state.result_mask = None
+    if 'detection_result' not in st.session_state:
+        st.session_state.detection_result = None
+    if 'confidence' not in st.session_state:
+        st.session_state.confidence = None
 
+# Load the model
 def load_model():
-    """Load the forgery detection model"""
-    with st.spinner("Loading model... This might take a moment."):
-        try:
-            # In a real application, this would be your actual HiFi_Net model
-            st.session_state['model'] = MockHiFiNet()
-            st.session_state['model_loaded'] = True
-            return True
-        except Exception as e:
-            st.error(f"Error loading model: {str(e)}")
-            return False
+    if not st.session_state.model_loaded:
+        with st.spinner('Loading the HiFi model. This might take a moment...'):
+            try:
+                st.session_state.model = HiFi_Net()
+                st.session_state.model_loaded = True
+                st.sidebar.success("Model loaded successfully!")
+            except Exception as e:
+                st.error(f"Error loading model: {str(e)}")
+                st.stop()
 
-def analyze_image(image_file):
-    """Analyze the uploaded image for forgery"""
-    if not st.session_state['model_loaded']:
-        st.warning("Model is not loaded yet. Please wait.")
-        return
+# Display the sidebar
+def display_sidebar():
+    st.sidebar.title("HiFi Image Forgery Detection")
+    st.sidebar.markdown("---")
+    st.sidebar.info(
+        "This app uses the Hierarchical Fine-Grained Image Forgery Detection model "
+        "to detect and localize image forgeries."
+    )
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Instructions")
+    st.sidebar.markdown(
+        "1. Upload an image\n"
+        "2. Wait for the analysis to complete\n"
+        "3. View the results and forgery mask"
+    )
     
-    with st.spinner("Analyzing image..."):
+    # Add model information
+    if st.session_state.model_loaded:
+        st.sidebar.markdown("---")
+        st.sidebar.success("✅ Model is loaded and ready")
+    else:
+        st.sidebar.warning("⚠️ Model is still loading")
+
+# Analyze the uploaded image
+def analyze_image(image_data):
+    if not st.session_state.model_loaded:
+        st.warning("Model is still loading. Please wait...")
+        return
+        
+    with st.spinner("Analyzing image for forgery..."):
         try:
-            # Save uploaded file temporarily
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
-                tmp.write(image_file.getvalue())
-                temp_path = tmp.name
-            
             # Run detection
-            decision, confidence = st.session_state['model'].detect(temp_path, verbose=True)
+            decision, confidence = st.session_state.model.detect(image_data)
+            st.session_state.detection_result = decision
+            st.session_state.confidence = confidence
             
             # Generate forgery mask
-            binary_mask = st.session_state['model'].localize(temp_path)
-            st.session_state['result_mask'] = (binary_mask * 255).astype(np.uint8)
+            binary_mask = st.session_state.model.localize(image_data)
+            st.session_state.result_mask = (binary_mask * 255.).astype(np.uint8)
             
-            # Clean up temporary file
-            os.unlink(temp_path)
-            
-            st.session_state['analyzed'] = True
-            return decision, confidence
+            return decision, confidence, st.session_state.result_mask
             
         except Exception as e:
             st.error(f"Analysis failed: {str(e)}")
-            return None, None
+            return None, None, None
 
-# App header
-st.title("Hierarchical Fine-Grained Image Forgery Detection")
-st.markdown("""
-This application detects and localizes image forgeries using a deep learning approach.
-Upload an image, and the system will analyze it for potential manipulations.
-""")
-
-# Load model on app start
-if not st.session_state['model_loaded']:
-    load_model()
-
-# Image upload
-uploaded_file = st.file_uploader("Choose an image file", type=['jpg', 'jpeg', 'png', 'bmp'])
-
-# Display image and analysis in columns
-col1, col2 = st.columns(2)
-
-if uploaded_file is not None:
-    # Display original image
-    with col1:
-        st.subheader("Original Image")
-        image = Image.open(uploaded_file)
-        st.image(image, use_column_width=True)
-        
-        # Analyze button
-        if st.button("Analyze Image"):
-            decision, confidence = analyze_image(uploaded_file)
-            if decision and confidence:
-                st.session_state['decision'] = decision
-                st.session_state['confidence'] = confidence
+# Main function to run the Streamlit app
+def main():
+    set_page_config()
+    init_session_state()
     
-    # Display results
-    with col2:
-        if st.session_state.get('analyzed', False):
-            st.subheader("Forgery Mask")
-            mask_img = Image.fromarray(st.session_state['result_mask'])
-            st.image(mask_img, use_column_width=True)
+    st.title("🔍 Hierarchical Fine-Grained Image Forgery Detection")
+    st.markdown("Upload an image to detect if it has been manipulated and see the forgery mask.")
+    
+    # Display the sidebar
+    display_sidebar()
+    
+    # Load the model (if not already loaded)
+    load_model()
+    
+    # File uploader
+    uploaded_file = st.file_uploader("Choose an image...", type=['jpg', 'jpeg', 'png', 'bmp'])
+    
+    if uploaded_file is not None:
+        # Read the image
+        image = Image.open(uploaded_file)
+        image_data = np.array(image)
+        
+        # Store the uploaded image
+        st.session_state.uploaded_image = image_data
+        
+        # Create two columns for displaying images
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Original Image")
+            st.image(image, use_column_width=True)
+        
+        # Add analyze button
+        if st.button("Analyze Image"):
+            decision, confidence, mask = analyze_image(image_data)
             
-            # Display result text
-            result_color = "red" if st.session_state['decision'] == "Forged" else "green"
-            st.markdown(f"""
-            <div style='background-color: rgba(0,0,0,0.05); padding: 15px; border-radius: 5px;'>
-                <h3 style='color: {result_color};'>Result: {st.session_state['decision']}</h3>
-                <h4>Confidence: {st.session_state['confidence']:.1f}%</h4>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Save button
-            if st.download_button(
-                label="Download Forgery Mask",
-                data=uploaded_file.getvalue() if uploaded_file else None,  # Replace with actual mask data in bytes
-                file_name="forgery_mask.png",
-                mime="image/png",
-                disabled=not st.session_state.get('analyzed', False)
-            ):
-                st.success("Mask downloaded successfully!")
+            if decision and mask is not None:
+                with col2:
+                    st.subheader("Forgery Mask")
+                    st.image(mask, use_column_width=True)
+                
+                # Display the result with styling
+                result_class = "forged" if decision == "Forged" else "real"
+                st.markdown(f"""
+                    <div class='result-text {result_class}'>
+                        Result: {decision} with {confidence:.1f}% confidence
+                    </div>
+                """, unsafe_allow_html=True)
+                
+                # Provide download option for the mask
+                if mask is not None:
+                    mask_image = Image.fromarray(mask)
+                    # Convert to bytes
+                    from io import BytesIO
+                    buf = BytesIO()
+                    mask_image.save(buf, format="PNG")
+                    byte_im = buf.getvalue()
+                    
+                    st.download_button(
+                        label="Download Forgery Mask",
+                        data=byte_im,
+                        file_name=f"forgery_mask_{uploaded_file.name.split('.')[0]}.png",
+                        mime="image/png"
+                    )
 
-# Add information about deployment
-st.sidebar.title("Deployment Info")
-st.sidebar.markdown("""
-### How to Share This App
-
-To share this app with your project mentor:
-
-1. **Deploy on Streamlit Cloud**:
-   - Create a GitHub repository with this code
-   - Connect it to [Streamlit Cloud](https://streamlit.io/cloud)
-   - Share the provided URL
-
-2. **Run Locally and Share via Ngrok**:
-   ```bash
-   pip install streamlit pyngrok
-   streamlit run app.py --server.port 8501
-   ngrok http 8501
-   ```
-   Then share the ngrok URL
-
-3. **Deploy on Heroku**:
-   - Create a Procfile and requirements.txt
-   - Push to Heroku
-   - Share the Heroku app URL
-""")
-
-# If this is a demo version, add a note
-st.sidebar.markdown("""
-### Note
-This is a demonstration version with mock model functionality.
-For actual deployment, replace the `MockHiFiNet` class with your 
-real implementation of the HiFi_Net model.
-""")
-
-# Instructions for the mentor
-st.sidebar.markdown("""
-### For the Mentor
-1. Upload an image using the file uploader
-2. Click "Analyze Image" to process
-3. View the forgery mask and detection results
-4. Download the mask if needed
-""")
-
-# Footer
-st.markdown("""
----
-*This application uses deep learning techniques to detect image forgeries.*
-""")
+if __name__ == "__main__":
+    main()
